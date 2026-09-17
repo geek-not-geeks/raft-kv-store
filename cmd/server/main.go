@@ -4,52 +4,93 @@ import (
 	"bufio"
 	"fmt"
 	"net"
+	"os"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/geeknotgeeks/raft-kv-store/raft"
 )
 
-// This is our actual "database" for now — just a map living in memory.
-// A sync.Mutex is a lock: since multiple clients could connect at once,
-// we need to make sure two of them never write to the map at the exact
-// same instant, which could corrupt it. The mutex prevents that.
+var myID string
+var myAddress string
+
+// The in-memory key-value store, same as Phase 1.
 var (
 	store = make(map[string]string)
 	mu    sync.Mutex
 )
 
 func main() {
-	// Start listening for incoming connections on port 8001.
-	listener, err := net.Listen("tcp", ":8001")
+	if len(os.Args) < 2 {
+		fmt.Println("Usage: go run cmd/server/main.go <nodeID>")
+		return
+	}
+	myID = os.Args[1]
+
+	for _, peer := range raft.ClusterConfig {
+		if peer.ID == myID {
+			myAddress = peer.Address
+		}
+	}
+	if myAddress == "" {
+		fmt.Println("Unknown node ID:", myID)
+		return
+	}
+
+	listener, err := net.Listen("tcp", myAddress)
 	if err != nil {
-		fmt.Println("Failed to start server:", err)
+		fmt.Println("Failed to start:", err)
 		return
 	}
 	defer listener.Close()
-	fmt.Println("Server listening on port 8001...")
+	fmt.Printf("[%s] listening on %s\n", myID, myAddress)
 
-	// Loop forever: each time someone connects, handle them.
+	go heartbeatLoop()
+
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			fmt.Println("Connection error:", err)
 			continue
 		}
-		// "go" here means: handle this connection in the background,
-		// so the server can immediately go back to accepting the NEXT
-		// client too, instead of making everyone wait in line.
 		go handleConnection(conn)
 	}
 }
 
+func heartbeatLoop() {
+	for {
+		for _, peer := range raft.ClusterConfig {
+			if peer.ID == myID {
+				continue
+			}
+			go pingPeer(peer)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func pingPeer(peer raft.Peer) {
+	conn, err := net.DialTimeout("tcp", peer.Address, 500*time.Millisecond)
+	if err != nil {
+		fmt.Printf("[%s] cannot reach %s\n", myID, peer.ID)
+		return
+	}
+	defer conn.Close()
+	conn.Write(fmt.Appendf(nil, "PING from %s\n", myID))
+	fmt.Printf("[%s] pinged %s successfully\n", myID, peer.ID)
+}
+
+// handleConnection is the Phase 1 logic: reads commands line by line
+// and responds to SET / GET / DELETE. PING messages from peers also
+// land here (via pingPeer above) and just fall into the default case.
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
 
 	for {
-		// Read one line of text the client sent (commands end in a newline).
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			return // client disconnected
+			return
 		}
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -92,10 +133,14 @@ func handleConnection(conn net.Conn) {
 				mu.Unlock()
 				response = "OK"
 			}
+		case "PING":
+			// A peer's heartbeat landed here — nothing to respond with,
+			// no client is waiting on the other end for a reply.
+			continue
 		default:
 			response = "ERROR: unknown command"
 		}
 
-		conn.Write([]byte(response + "\n"))
+		conn.Write(fmt.Appendf(nil, "%s\n", response))
 	}
 }
