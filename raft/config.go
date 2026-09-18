@@ -1,14 +1,13 @@
 package raft
 
-// Peer describes one server in the cluster.
 type Peer struct {
-	ID      string
-	Address string // e.g. "localhost:8001"
+	ID            string
+	ClientAddress string // SET/GET/DELETE clients connect here
+	RaftAddress   string // other Raft nodes talk to this node here (internal only)
 }
 
-// ClusterConfig is the full list of servers that make up the cluster.
 var ClusterConfig = []Peer{
-	{ID: "node1", Address: "localhost:8001"},
-	{ID: "node2", Address: "localhost:8002"},
-	{ID: "node3", Address: "localhost:8003"},
+	{ID: "node1", ClientAddress: "localhost:8001", RaftAddress: "localhost:9001"},
+	{ID: "node2", ClientAddress: "localhost:8002", RaftAddress: "localhost:9002"},
+	{ID: "node3", ClientAddress: "localhost:8003", RaftAddress: "localhost:9003"},
 }

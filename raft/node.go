@@ -1,11 +1,8 @@
 package raft
 
 import (
-	"bufio"
 	"fmt"
 	"math/rand"
-	"net"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -42,25 +39,37 @@ type Node struct {
 	State       State
 	LeaderID    string
 
+	// Log[0] is a dummy entry (term 0) so real entries start at index 1 -
+	// this avoids "index - 1" special-casing everywhere else.
+	Log         []LogEntry
+	CommitIndex int
+	LastApplied int
+
+	// Leader-only bookkeeping: per peer, the index we think it needs next,
+	// and the highest index we've confirmed it actually has.
+	NextIndex  map[string]int
+	MatchIndex map[string]int
+
 	resetElectionTimer chan bool
+
+	// ApplyFn hands a safely-committed command to the real key-value store.
+	ApplyFn func(command string)
 }
 
 func NewNode(id string, peers []Peer) *Node {
 	return &Node{
 		ID:                 id,
 		Peers:              peers,
-		CurrentTerm:        0,
 		State:              Follower,
+		Log:                []LogEntry{{Term: 0, Command: ""}},
 		resetElectionTimer: make(chan bool, 1),
 	}
 }
 
 func randomElectionTimeout() time.Duration {
-	ms := 150 + rand.Intn(150) // 150-299ms
-	return time.Duration(ms) * time.Millisecond
+	return time.Duration(150+rand.Intn(150)) * time.Millisecond
 }
 
-// RunElectionTimer should be started once, in a goroutine, when a node boots.
 func (n *Node) RunElectionTimer() {
 	for {
 		timeout := randomElectionTimeout()
@@ -70,10 +79,6 @@ func (n *Node) RunElectionTimer() {
 			isLeader := n.State == Leader
 			n.mu.Unlock()
 			if isLeader {
-				// Leaders don't run elections against themselves. A leader
-				// only steps down when it learns of a higher term from
-				// someone else's message (handled in HandleHeartbeat /
-				// HandleRequestVote below).
 				continue
 			}
 			n.startElection()
@@ -109,11 +114,25 @@ func (n *Node) startElection() {
 			continue
 		}
 		go func(p Peer) {
-			granted := n.sendRequestVote(p, currentTerm)
+			args := RequestVoteArgs{Term: currentTerm, CandidateID: n.ID}
+			var reply RequestVoteReply
+			if err := sendRPC(p.RaftAddress, "RequestVote", args, &reply); err != nil {
+				return
+			}
+
+			n.mu.Lock()
+			if reply.Term > n.CurrentTerm {
+				n.CurrentTerm = reply.Term
+				n.State = Follower
+				n.VotedFor = ""
+				n.mu.Unlock()
+				return
+			}
+			n.mu.Unlock()
 
 			votesMu.Lock()
 			defer votesMu.Unlock()
-			if decided || !granted {
+			if decided || !reply.VoteGranted {
 				return
 			}
 			votes++
@@ -125,29 +144,6 @@ func (n *Node) startElection() {
 	}
 }
 
-func (n *Node) sendRequestVote(peer Peer, term int) bool {
-	conn, err := net.DialTimeout("tcp", peer.Address, 300*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	defer conn.Close()
-
-	msg := fmt.Sprintf("REQUESTVOTE %d %s\n", term, n.ID)
-	conn.Write([]byte(msg))
-
-	reader := bufio.NewReader(conn)
-	response, err := reader.ReadString('\n')
-	if err != nil {
-		return false
-	}
-	response = strings.TrimSpace(response)
-	parts := strings.Split(response, " ")
-	if len(parts) != 3 || parts[0] != "VOTE" {
-		return false
-	}
-	return parts[2] == "true"
-}
-
 func (n *Node) becomeLeader(term int) {
 	n.mu.Lock()
 	if n.State != Candidate || n.CurrentTerm != term {
@@ -156,13 +152,23 @@ func (n *Node) becomeLeader(term int) {
 	}
 	n.State = Leader
 	n.LeaderID = n.ID
+	n.NextIndex = make(map[string]int)
+	n.MatchIndex = make(map[string]int)
+	lastLogIndex := len(n.Log) - 1
+	for _, peer := range n.Peers {
+		if peer.ID == n.ID {
+			continue
+		}
+		n.NextIndex[peer.ID] = lastLogIndex + 1
+		n.MatchIndex[peer.ID] = 0
+	}
 	n.mu.Unlock()
 
 	fmt.Printf("[%s] *** became LEADER for term %d ***\n", n.ID, term)
-	go n.leaderHeartbeatLoop(term)
+	go n.leaderReplicationLoop(term)
 }
 
-func (n *Node) leaderHeartbeatLoop(term int) {
+func (n *Node) leaderReplicationLoop(term int) {
 	for {
 		n.mu.Lock()
 		stillLeader := n.State == Leader && n.CurrentTerm == term
@@ -174,63 +180,187 @@ func (n *Node) leaderHeartbeatLoop(term int) {
 			if peer.ID == n.ID {
 				continue
 			}
-			go n.sendHeartbeat(peer, term)
+			go n.replicateToPeer(peer, term)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 }
 
-func (n *Node) sendHeartbeat(peer Peer, term int) {
-	conn, err := net.DialTimeout("tcp", peer.Address, 300*time.Millisecond)
-	if err != nil {
+func (n *Node) replicateToPeer(peer Peer, term int) {
+	n.mu.Lock()
+	if n.State != Leader || n.CurrentTerm != term {
+		n.mu.Unlock()
 		return
 	}
-	defer conn.Close()
-	msg := fmt.Sprintf("HEARTBEAT %d %s\n", term, n.ID)
-	conn.Write([]byte(msg))
-}
+	nextIdx := n.NextIndex[peer.ID]
+	prevLogIndex := nextIdx - 1
+	prevLogTerm := 0
+	if prevLogIndex >= 0 && prevLogIndex < len(n.Log) {
+		prevLogTerm = n.Log[prevLogIndex].Term
+	}
+	var entries []LogEntry
+	if nextIdx < len(n.Log) {
+		entries = append(entries, n.Log[nextIdx:]...)
+	}
+	args := AppendEntriesArgs{
+		Term: term, LeaderID: n.ID,
+		PrevLogIndex: prevLogIndex, PrevLogTerm: prevLogTerm,
+		Entries: entries, LeaderCommit: n.CommitIndex,
+	}
+	n.mu.Unlock()
 
-func (n *Node) HandleRequestVote(term int, candidateID string) (int, bool) {
+	var reply AppendEntriesReply
+	if err := sendRPC(peer.RaftAddress, "AppendEntries", args, &reply); err != nil {
+		return // unreachable this round, retried automatically next tick
+	}
+
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	if term < n.CurrentTerm {
-		return n.CurrentTerm, false
+	if reply.Term > n.CurrentTerm {
+		n.CurrentTerm = reply.Term
+		n.State = Follower
+		n.VotedFor = ""
+		return
 	}
-	if term > n.CurrentTerm {
-		n.CurrentTerm = term
+	if n.State != Leader || n.CurrentTerm != term {
+		return
+	}
+
+	if reply.Success {
+		n.MatchIndex[peer.ID] = prevLogIndex + len(args.Entries)
+		n.NextIndex[peer.ID] = n.MatchIndex[peer.ID] + 1
+		n.advanceCommitIndex(term)
+	} else if n.NextIndex[peer.ID] > 1 {
+		n.NextIndex[peer.ID]-- // log mismatch — back off and retry earlier
+	}
+}
+
+// advanceCommitIndex: if a majority now has index N, and that entry was
+// written in the LEADER'S CURRENT term (a real Raft safety rule), commit it.
+func (n *Node) advanceCommitIndex(term int) {
+	for N := len(n.Log) - 1; N > n.CommitIndex; N-- {
+		if n.Log[N].Term != term {
+			continue
+		}
+		count := 1
+		for _, peer := range n.Peers {
+			if peer.ID != n.ID && n.MatchIndex[peer.ID] >= N {
+				count++
+			}
+		}
+		if count > len(n.Peers)/2 {
+			n.CommitIndex = N
+			n.applyCommitted()
+			return
+		}
+	}
+}
+
+// applyCommitted must be called with n.mu already held.
+func (n *Node) applyCommitted() {
+	for n.LastApplied < n.CommitIndex {
+		n.LastApplied++
+		entry := n.Log[n.LastApplied]
+		if n.ApplyFn != nil && entry.Command != "" {
+			n.ApplyFn(entry.Command)
+		}
+	}
+}
+
+// Propose is called when a client SET/DELETE arrives at this node. It
+// blocks until the entry is committed by a majority, or times out.
+func (n *Node) Propose(command string) error {
+	n.mu.Lock()
+	if n.State != Leader {
+		leader := n.LeaderID
+		n.mu.Unlock()
+		if leader == "" {
+			return fmt.Errorf("no known leader right now, try again shortly")
+		}
+		return fmt.Errorf("not leader, leader is %s", leader)
+	}
+	n.Log = append(n.Log, LogEntry{Term: n.CurrentTerm, Command: command})
+	index := len(n.Log) - 1
+	n.mu.Unlock()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		n.mu.Lock()
+		committed := n.CommitIndex >= index
+		stillLeader := n.State == Leader
+		n.mu.Unlock()
+		if committed {
+			return nil
+		}
+		if !stillLeader {
+			return fmt.Errorf("lost leadership before command committed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return fmt.Errorf("timed out waiting for commit")
+}
+
+func (n *Node) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if args.Term < n.CurrentTerm {
+		return RequestVoteReply{Term: n.CurrentTerm, VoteGranted: false}
+	}
+	if args.Term > n.CurrentTerm {
+		n.CurrentTerm = args.Term
 		n.VotedFor = ""
 		n.State = Follower
 	}
-
 	granted := false
-	if n.VotedFor == "" || n.VotedFor == candidateID {
-		n.VotedFor = candidateID
+	if n.VotedFor == "" || n.VotedFor == args.CandidateID {
+		n.VotedFor = args.CandidateID
 		granted = true
 		n.ResetTimer()
 	}
-	fmt.Printf("[%s] vote request from %s (term %d) — granted: %t\n", n.ID, candidateID, term, granted)
-	return n.CurrentTerm, granted
+	fmt.Printf("[%s] vote request from %s (term %d) — granted: %t\n", n.ID, args.CandidateID, args.Term, granted)
+	return RequestVoteReply{Term: n.CurrentTerm, VoteGranted: granted}
 }
 
-func (n *Node) HandleHeartbeat(term int, leaderID string) int {
+func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	if term < n.CurrentTerm {
-		return n.CurrentTerm
+	if args.Term < n.CurrentTerm {
+		return AppendEntriesReply{Term: n.CurrentTerm, Success: false}
 	}
-	if n.LeaderID != leaderID || n.State != Follower {
-		fmt.Printf("[%s] recognizing %s as leader (term %d)\n", n.ID, leaderID, term)
+	if n.LeaderID != args.LeaderID || n.State != Follower || args.Term > n.CurrentTerm {
+		fmt.Printf("[%s] recognizing %s as leader (term %d)\n", n.ID, args.LeaderID, args.Term)
 	}
-	n.CurrentTerm = term
+	n.CurrentTerm = args.Term
 	n.State = Follower
-	n.LeaderID = leaderID
+	n.LeaderID = args.LeaderID
 	n.ResetTimer()
-	return n.CurrentTerm
-}
 
-func ParseInt(s string) int {
-	i, _ := strconv.Atoi(s)
-	return i
+	if args.PrevLogIndex >= len(n.Log) {
+		return AppendEntriesReply{Term: n.CurrentTerm, Success: false}
+	}
+	if args.PrevLogIndex >= 0 && n.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		return AppendEntriesReply{Term: n.CurrentTerm, Success: false}
+	}
+
+	if len(args.Entries) > 0 {
+		n.Log = append(n.Log[:args.PrevLogIndex+1], args.Entries...)
+		var cmds []string
+		for _, e := range args.Entries {
+			cmds = append(cmds, e.Command)
+		}
+		fmt.Printf("[%s] appended %d entr(ies): %s\n", n.ID, len(args.Entries), strings.Join(cmds, " | "))
+	}
+
+	if args.LeaderCommit > n.CommitIndex {
+		newCommit := args.LeaderCommit
+		if lastIdx := len(n.Log) - 1; newCommit > lastIdx {
+			newCommit = lastIdx
+		}
+		n.CommitIndex = newCommit
+		n.applyCommitted()
+	}
+	return AppendEntriesReply{Term: n.CurrentTerm, Success: true}
 }

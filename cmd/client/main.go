@@ -8,14 +8,19 @@ import (
 )
 
 func main() {
-	conn, err := net.Dial("tcp", "localhost:8001")
+	address := "localhost:8001"
+	if len(os.Args) > 1 {
+		address = os.Args[1]
+	}
+
+	conn, err := net.Dial("tcp", address)
 	if err != nil {
 		fmt.Println("Could not connect to server:", err)
 		return
 	}
 	defer conn.Close()
 
-	fmt.Println("Connected to KV store. Type commands like: SET x 5")
+	fmt.Println("Connected to", address, "— if you get 'not leader', reconnect using the address it names")
 	scanner := bufio.NewScanner(os.Stdin)
 	serverReader := bufio.NewReader(conn)
 
@@ -24,19 +29,12 @@ func main() {
 		if !scanner.Scan() {
 			break
 		}
-		input := scanner.Text()
-
-		conn.Write([]byte(input + "\n"))
-
+		conn.Write([]byte(scanner.Text() + "\n"))
 		response, err := serverReader.ReadString('\n')
 		if err != nil {
 			fmt.Println("Server disconnected.")
 			return
 		}
 		fmt.Print(response)
-	}
-
-	if err := scanner.Err(); err != nil {
-		fmt.Println("Error reading input:", err)
 	}
 }

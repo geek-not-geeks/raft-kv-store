@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -24,39 +25,71 @@ func main() {
 	}
 	myID := os.Args[1]
 
-	var myAddress string
+	var clientAddress, raftAddress string
 	for _, peer := range raft.ClusterConfig {
 		if peer.ID == myID {
-			myAddress = peer.Address
+			clientAddress = peer.ClientAddress
+			raftAddress = peer.RaftAddress
 		}
 	}
-	if myAddress == "" {
+	if clientAddress == "" {
 		fmt.Println("Unknown node ID:", myID)
 		return
 	}
 
 	node = raft.NewNode(myID, raft.ClusterConfig)
+	node.ApplyFn = applyToStore
 
-	listener, err := net.Listen("tcp", myAddress)
+	clientListener, err := net.Listen("tcp", clientAddress)
 	if err != nil {
-		fmt.Println("Failed to start:", err)
+		fmt.Println("Failed to start client listener:", err)
 		return
 	}
-	defer listener.Close()
-	fmt.Printf("[%s] listening on %s\n", myID, myAddress)
+	defer clientListener.Close()
+
+	raftListener, err := net.Listen("tcp", raftAddress)
+	if err != nil {
+		fmt.Println("Failed to start raft listener:", err)
+		return
+	}
+	defer raftListener.Close()
+
+	fmt.Printf("[%s] client port %s, raft port %s\n", myID, clientAddress, raftAddress)
 
 	go node.RunElectionTimer()
+	go acceptLoop(raftListener, handleRaftConnection)
+	acceptLoop(clientListener, handleClientConnection)
+}
 
+func acceptLoop(listener net.Listener, handler func(net.Conn)) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			continue
 		}
-		go handleConnection(conn)
+		go handler(conn)
 	}
 }
 
-func handleConnection(conn net.Conn) {
+func applyToStore(command string) {
+	parts := strings.SplitN(command, " ", 3)
+	switch strings.ToUpper(parts[0]) {
+	case "SET":
+		if len(parts) == 3 {
+			mu.Lock()
+			store[parts[1]] = parts[2]
+			mu.Unlock()
+		}
+	case "DELETE":
+		if len(parts) >= 2 {
+			mu.Lock()
+			delete(store, parts[1])
+			mu.Unlock()
+		}
+	}
+}
+
+func handleClientConnection(conn net.Conn) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
 
@@ -69,7 +102,6 @@ func handleConnection(conn net.Conn) {
 		if line == "" {
 			continue
 		}
-
 		parts := strings.SplitN(line, " ", 3)
 		command := strings.ToUpper(parts[0])
 
@@ -78,10 +110,17 @@ func handleConnection(conn net.Conn) {
 		case "SET":
 			if len(parts) < 3 {
 				response = "ERROR: usage is SET key value"
+			} else if err := node.Propose(line); err != nil {
+				response = "ERROR: " + err.Error()
 			} else {
-				mu.Lock()
-				store[parts[1]] = parts[2]
-				mu.Unlock()
+				response = "OK"
+			}
+		case "DELETE":
+			if len(parts) < 2 {
+				response = "ERROR: usage is DELETE key"
+			} else if err := node.Propose(line); err != nil {
+				response = "ERROR: " + err.Error()
+			} else {
 				response = "OK"
 			}
 		case "GET":
@@ -97,31 +136,32 @@ func handleConnection(conn net.Conn) {
 					response = "ERROR: key not found"
 				}
 			}
-		case "DELETE":
-			if len(parts) < 2 {
-				response = "ERROR: usage is DELETE key"
-			} else {
-				mu.Lock()
-				delete(store, parts[1])
-				mu.Unlock()
-				response = "OK"
-			}
-		case "REQUESTVOTE":
-			// format: REQUESTVOTE <term> <candidateID>
-			term := raft.ParseInt(parts[1])
-			candidateID := parts[2]
-			currentTerm, granted := node.HandleRequestVote(term, candidateID)
-			response = fmt.Sprintf("VOTE %d %t", currentTerm, granted)
-		case "HEARTBEAT":
-			// format: HEARTBEAT <term> <leaderID>
-			term := raft.ParseInt(parts[1])
-			leaderID := parts[2]
-			currentTerm := node.HandleHeartbeat(term, leaderID)
-			response = fmt.Sprintf("ACK %d", currentTerm)
 		default:
 			response = "ERROR: unknown command"
 		}
-
 		conn.Write([]byte(response + "\n"))
+	}
+}
+
+type rpcEnvelope struct {
+	Kind string          `json:"kind"`
+	Body json.RawMessage `json:"body"`
+}
+
+func handleRaftConnection(conn net.Conn) {
+	defer conn.Close()
+	var env rpcEnvelope
+	if err := json.NewDecoder(conn).Decode(&env); err != nil {
+		return
+	}
+	switch env.Kind {
+	case "RequestVote":
+		var args raft.RequestVoteArgs
+		json.Unmarshal(env.Body, &args)
+		json.NewEncoder(conn).Encode(node.HandleRequestVote(args))
+	case "AppendEntries":
+		var args raft.AppendEntriesArgs
+		json.Unmarshal(env.Body, &args)
+		json.NewEncoder(conn).Encode(node.HandleAppendEntries(args))
 	}
 }
