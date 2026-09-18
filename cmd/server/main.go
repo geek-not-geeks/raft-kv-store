@@ -7,18 +7,14 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/geeknotgeeks/raft-kv-store/raft"
 )
 
-var myID string
-var myAddress string
-
-// The in-memory key-value store, same as Phase 1.
 var (
 	store = make(map[string]string)
 	mu    sync.Mutex
+	node  *raft.Node
 )
 
 func main() {
@@ -26,8 +22,9 @@ func main() {
 		fmt.Println("Usage: go run cmd/server/main.go <nodeID>")
 		return
 	}
-	myID = os.Args[1]
+	myID := os.Args[1]
 
+	var myAddress string
 	for _, peer := range raft.ClusterConfig {
 		if peer.ID == myID {
 			myAddress = peer.Address
@@ -38,6 +35,8 @@ func main() {
 		return
 	}
 
+	node = raft.NewNode(myID, raft.ClusterConfig)
+
 	listener, err := net.Listen("tcp", myAddress)
 	if err != nil {
 		fmt.Println("Failed to start:", err)
@@ -46,7 +45,7 @@ func main() {
 	defer listener.Close()
 	fmt.Printf("[%s] listening on %s\n", myID, myAddress)
 
-	go heartbeatLoop()
+	go node.RunElectionTimer()
 
 	for {
 		conn, err := listener.Accept()
@@ -57,32 +56,6 @@ func main() {
 	}
 }
 
-func heartbeatLoop() {
-	for {
-		for _, peer := range raft.ClusterConfig {
-			if peer.ID == myID {
-				continue
-			}
-			go pingPeer(peer)
-		}
-		time.Sleep(2 * time.Second)
-	}
-}
-
-func pingPeer(peer raft.Peer) {
-	conn, err := net.DialTimeout("tcp", peer.Address, 500*time.Millisecond)
-	if err != nil {
-		fmt.Printf("[%s] cannot reach %s\n", myID, peer.ID)
-		return
-	}
-	defer conn.Close()
-	conn.Write(fmt.Appendf(nil, "PING from %s\n", myID))
-	fmt.Printf("[%s] pinged %s successfully\n", myID, peer.ID)
-}
-
-// handleConnection is the Phase 1 logic: reads commands line by line
-// and responds to SET / GET / DELETE. PING messages from peers also
-// land here (via pingPeer above) and just fall into the default case.
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
@@ -133,14 +106,22 @@ func handleConnection(conn net.Conn) {
 				mu.Unlock()
 				response = "OK"
 			}
-		case "PING":
-			// A peer's heartbeat landed here — nothing to respond with,
-			// no client is waiting on the other end for a reply.
-			continue
+		case "REQUESTVOTE":
+			// format: REQUESTVOTE <term> <candidateID>
+			term := raft.ParseInt(parts[1])
+			candidateID := parts[2]
+			currentTerm, granted := node.HandleRequestVote(term, candidateID)
+			response = fmt.Sprintf("VOTE %d %t", currentTerm, granted)
+		case "HEARTBEAT":
+			// format: HEARTBEAT <term> <leaderID>
+			term := raft.ParseInt(parts[1])
+			leaderID := parts[2]
+			currentTerm := node.HandleHeartbeat(term, leaderID)
+			response = fmt.Sprintf("ACK %d", currentTerm)
 		default:
 			response = "ERROR: unknown command"
 		}
 
-		conn.Write(fmt.Appendf(nil, "%s\n", response))
+		conn.Write([]byte(response + "\n"))
 	}
 }
