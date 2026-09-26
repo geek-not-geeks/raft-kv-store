@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/geek-not-geeks/raft-kv-store/raft"
 )
@@ -108,6 +109,13 @@ func handleClientConnection(conn net.Conn) {
 
 		var response string
 		switch command {
+		case "KILL":
+			conn.Write([]byte("OK - shutting down\n"))
+			go func() {
+				time.Sleep(50 * time.Millisecond)
+				os.Exit(0)
+			}()
+			return
 		case "SET":
 			if len(parts) < 3 {
 				response = "ERROR: usage is SET key value"

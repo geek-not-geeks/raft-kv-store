@@ -21,3 +21,7 @@ Log replication. Switched peer RPCs from plain text to JSON (RequestVote/AppendE
 Chaos test: 3 nodes, ~600 writes over 45s, killed and restarted 2 different nodes mid-run (including once during load). First run failed - a restarted node with an empty log took too long to recatch up because NextIndex only backed off one entry at a time. Fixed by adding conflict-index/term info to AppendEntries replies so the leader can jump back to the right point in one round trip instead of crawling backward.
 
 After the fix: re-ran the same kill pattern. First verify run showed 1 of 10 keys briefly mismatched on one node - reran immediately, all nodes matched. This is expected: DUMP reads a node's local state directly, not through consensus, so a follower can be a beat behind right after catching up. Not a correctness violation, just confirms reads aren't guaranteed fresh on followers.
+
+
+## Phase 7
+Benchmarked with 20 concurrent clients for 10s: 396 writes/sec sustained, 0 failures. Initial failover measurements were wrong - was manually killing the leader with Ctrl+C and getting numbers under 20ms, which is physically impossible given a 150-300ms election timeout floor. Traced it to human reaction time between kill and starting the timer. Fixed by adding a KILL command the benchmark sends directly to the leader, so the timer starts at the exact moment of death. Real numbers: 250-320ms across multiple runs, consistent with the configured timeout range.
