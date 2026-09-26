@@ -16,10 +16,9 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-// LogEntry is one recorded command in the replicated log.
 type LogEntry struct {
 	Term    int
-	Command string // e.g. "SET x 5" or "DELETE x"
+	Command string
 }
 
 type AppendEntriesArgs struct {
@@ -34,6 +33,11 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	// Used only when Success is false, so the leader can jump back
+	// directly to the right point instead of retrying one index at a time.
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 type rpcEnvelope struct {
@@ -41,8 +45,6 @@ type rpcEnvelope struct {
 	Body json.RawMessage `json:"body"`
 }
 
-// sendRPC dials a peer's internal Raft port, sends a JSON request tagged
-// with its kind, and decodes the JSON reply into reply.
 func sendRPC(address string, kind string, args interface{}, reply interface{}) error {
 	conn, err := net.DialTimeout("tcp", address, 300*time.Millisecond)
 	if err != nil {

@@ -247,8 +247,29 @@ func (n *Node) replicateToPeer(peer Peer, term int) {
 		n.MatchIndex[peer.ID] = prevLogIndex + len(args.Entries)
 		n.NextIndex[peer.ID] = n.MatchIndex[peer.ID] + 1
 		n.advanceCommitIndex(term)
-	} else if n.NextIndex[peer.ID] > 1 {
-		n.NextIndex[peer.ID]--
+		return
+	}
+
+	// Fast backtrack using the follower's conflict info, instead of
+	// decrementing NextIndex one at a time (which is what made recovery
+	// slow enough to lose the chaos test earlier).
+	if reply.ConflictTerm == 0 {
+		n.NextIndex[peer.ID] = reply.ConflictIndex
+	} else {
+		newNext := -1
+		for i := len(n.Log) - 1; i >= 0; i-- {
+			if n.Log[i].Term == reply.ConflictTerm {
+				newNext = i + 1
+				break
+			}
+		}
+		if newNext == -1 {
+			newNext = reply.ConflictIndex
+		}
+		n.NextIndex[peer.ID] = newNext
+	}
+	if n.NextIndex[peer.ID] < 1 {
+		n.NextIndex[peer.ID] = 1
 	}
 }
 
@@ -364,10 +385,23 @@ func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	n.ResetTimer()
 
 	if args.PrevLogIndex >= len(n.Log) {
-		return AppendEntriesReply{Term: n.CurrentTerm, Success: false}
+		// Our log is shorter than the leader expects — tell it exactly
+		// where our log actually ends, so it can jump straight there.
+		return AppendEntriesReply{
+			Term: n.CurrentTerm, Success: false,
+			ConflictIndex: len(n.Log), ConflictTerm: 0,
+		}
 	}
 	if args.PrevLogIndex >= 0 && n.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		return AppendEntriesReply{Term: n.CurrentTerm, Success: false}
+		conflictTerm := n.Log[args.PrevLogIndex].Term
+		firstIndex := args.PrevLogIndex
+		for firstIndex > 0 && n.Log[firstIndex-1].Term == conflictTerm {
+			firstIndex--
+		}
+		return AppendEntriesReply{
+			Term: n.CurrentTerm, Success: false,
+			ConflictIndex: firstIndex, ConflictTerm: conflictTerm,
+		}
 	}
 
 	if len(args.Entries) > 0 {

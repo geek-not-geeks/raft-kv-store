@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 
@@ -145,6 +146,25 @@ func handleClientConnection(conn net.Conn) {
 			} else {
 				node.SetPartitioned(false)
 				response = "OK - partition healed"
+			}
+		case "DUMP":
+			mu.Lock()
+			keys := make([]string, 0, len(store))
+			for k := range store {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			var sb strings.Builder
+			for _, k := range keys {
+				sb.WriteString(k)
+				sb.WriteString("=")
+				sb.WriteString(store[k])
+				sb.WriteString(";")
+			}
+			mu.Unlock()
+			response = sb.String()
+			if response == "" {
+				response = "EMPTY"
 			}
 		default:
 			response = "ERROR: unknown command"
