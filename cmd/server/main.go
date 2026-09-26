@@ -9,7 +9,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/geeknotgeeks/raft-kv-store/raft"
+	"github.com/geek-not-geeks/raft-kv-store/raft"
 )
 
 var (
@@ -135,6 +135,16 @@ func handleClientConnection(conn net.Conn) {
 				} else {
 					response = "ERROR: key not found"
 				}
+			}
+		case "PARTITION":
+			if len(parts) < 2 {
+				response = "ERROR: usage is PARTITION on|off"
+			} else if parts[1] == "on" {
+				node.SetPartitioned(true)
+				response = "OK - simulating network partition"
+			} else {
+				node.SetPartitioned(false)
+				response = "OK - partition healed"
 			}
 		default:
 			response = "ERROR: unknown command"

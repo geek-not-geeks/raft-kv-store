@@ -37,4 +37,7 @@ func main() {
 		}
 		fmt.Print(response)
 	}
+	if err := scanner.Err(); err != nil {
+		fmt.Println("Scanner error:", err)
+	}
 }

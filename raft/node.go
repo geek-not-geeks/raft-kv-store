@@ -39,20 +39,16 @@ type Node struct {
 	State       State
 	LeaderID    string
 
-	// Log[0] is a dummy entry (term 0) so real entries start at index 1 -
-	// this avoids "index - 1" special-casing everywhere else.
 	Log         []LogEntry
 	CommitIndex int
 	LastApplied int
 
-	// Leader-only bookkeeping: per peer, the index we think it needs next,
-	// and the highest index we've confirmed it actually has.
 	NextIndex  map[string]int
 	MatchIndex map[string]int
 
 	resetElectionTimer chan bool
+	Partitioned        bool
 
-	// ApplyFn hands a safely-committed command to the real key-value store.
 	ApplyFn func(command string)
 }
 
@@ -64,6 +60,18 @@ func NewNode(id string, peers []Peer) *Node {
 		Log:                []LogEntry{{Term: 0, Command: ""}},
 		resetElectionTimer: make(chan bool, 1),
 	}
+}
+
+func (n *Node) SetPartitioned(p bool) {
+	n.mu.Lock()
+	n.Partitioned = p
+	n.mu.Unlock()
+}
+
+func (n *Node) IsPartitioned() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.Partitioned
 }
 
 func randomElectionTimeout() time.Duration {
@@ -97,6 +105,10 @@ func (n *Node) ResetTimer() {
 
 func (n *Node) startElection() {
 	n.mu.Lock()
+	if n.Partitioned {
+		n.mu.Unlock()
+		return
+	}
 	n.State = Candidate
 	n.CurrentTerm++
 	currentTerm := n.CurrentTerm
@@ -188,6 +200,10 @@ func (n *Node) leaderReplicationLoop(term int) {
 
 func (n *Node) replicateToPeer(peer Peer, term int) {
 	n.mu.Lock()
+	if n.Partitioned {
+		n.mu.Unlock()
+		return
+	}
 	if n.State != Leader || n.CurrentTerm != term {
 		n.mu.Unlock()
 		return
@@ -211,7 +227,7 @@ func (n *Node) replicateToPeer(peer Peer, term int) {
 
 	var reply AppendEntriesReply
 	if err := sendRPC(peer.RaftAddress, "AppendEntries", args, &reply); err != nil {
-		return // unreachable this round, retried automatically next tick
+		return
 	}
 
 	n.mu.Lock()
@@ -232,12 +248,10 @@ func (n *Node) replicateToPeer(peer Peer, term int) {
 		n.NextIndex[peer.ID] = n.MatchIndex[peer.ID] + 1
 		n.advanceCommitIndex(term)
 	} else if n.NextIndex[peer.ID] > 1 {
-		n.NextIndex[peer.ID]-- // log mismatch — back off and retry earlier
+		n.NextIndex[peer.ID]--
 	}
 }
 
-// advanceCommitIndex: if a majority now has index N, and that entry was
-// written in the LEADER'S CURRENT term (a real Raft safety rule), commit it.
 func (n *Node) advanceCommitIndex(term int) {
 	for N := len(n.Log) - 1; N > n.CommitIndex; N-- {
 		if n.Log[N].Term != term {
@@ -257,7 +271,6 @@ func (n *Node) advanceCommitIndex(term int) {
 	}
 }
 
-// applyCommitted must be called with n.mu already held.
 func (n *Node) applyCommitted() {
 	for n.LastApplied < n.CommitIndex {
 		n.LastApplied++
@@ -268,10 +281,12 @@ func (n *Node) applyCommitted() {
 	}
 }
 
-// Propose is called when a client SET/DELETE arrives at this node. It
-// blocks until the entry is committed by a majority, or times out.
 func (n *Node) Propose(command string) error {
 	n.mu.Lock()
+	if n.Partitioned {
+		n.mu.Unlock()
+		return fmt.Errorf("this node is partitioned (simulated network cut)")
+	}
 	if n.State != Leader {
 		leader := n.LeaderID
 		n.mu.Unlock()
@@ -303,6 +318,11 @@ func (n *Node) Propose(command string) error {
 
 func (n *Node) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	n.mu.Lock()
+	if n.Partitioned {
+		term := n.CurrentTerm
+		n.mu.Unlock()
+		return RequestVoteReply{Term: term, VoteGranted: false}
+	}
 	defer n.mu.Unlock()
 
 	if args.Term < n.CurrentTerm {
@@ -325,6 +345,11 @@ func (n *Node) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 
 func (n *Node) HandleAppendEntries(args AppendEntriesArgs) AppendEntriesReply {
 	n.mu.Lock()
+	if n.Partitioned {
+		term := n.CurrentTerm
+		n.mu.Unlock()
+		return AppendEntriesReply{Term: term, Success: false}
+	}
 	defer n.mu.Unlock()
 
 	if args.Term < n.CurrentTerm {
