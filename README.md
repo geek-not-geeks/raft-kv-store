@@ -16,6 +16,30 @@ This was built as a learning project to understand how real distributed database
 
 This is not a novel algorithm and does not claim to be. Raft already exists and is well documented. This project is an implementation and rigorous testing of it, not research. It also does not include performance optimizations real systems use, like batching or log compaction. Those are listed under "what's missing" below.
 
+## Live demo
+
+Three browser tabs, one per node, showing the same replicated value live.
+
+Node3 as leader, box is editable:
+
+![Node3 leader](screenshots/01-node3-leader.png)
+
+Node2, a follower, read only, showing the same value:
+
+![Node2 follower](screenshots/02-node2-follower.png)
+
+Node3's view again:
+
+![Node3 view](screenshots/03-node3-view.png)
+
+Node3 killed mid-demo, that tab goes unreachable:
+
+![Node3 dead](screenshots/04-node3-dead.png)
+
+Node1 automatically takes over as the new leader:
+
+![Node1 new leader](screenshots/05-node1-new-leader.png)
+
 ## Running it
 
 You need Go installed. Clone the repo, then in three separate terminals:
